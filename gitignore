@@ -1,0 +1,10 @@
+# Secretos: la key de SerpApi vive acá y NUNCA se commitea
+.env
+
+# Salidas generadas (datos de prospectos y respuestas crudas de la API)
+*.xlsx
+crudo/
+
+__pycache__/
+*.pyc
+.venv/
