@@ -35,18 +35,20 @@ from openpyxl import Workbook
 # ------------------------------------------------------------------
 # CONFIGURACIÓN (lo único que vas a tocar seguido)
 # ------------------------------------------------------------------
-RUBROS = ["restaurante", "parrilla", "pizzería", "hamburguesería", "sushi", "cafetería",
-          "panadería", "heladería", "cervecería", "rotisería", "pastas", "empanadas"]
-# Zonas agrupadas para ahorrar búsquedas (Google ya devuelve lo que hay alrededor)
-ZONAS = ["San Isidro", "Martínez", "Boulogne"]
+RUBROS = ["cafetería", "pizzería", "restaurante", "hamburguesería"]
+# El orden de ZONAS es también el orden del Excel final
+ZONAS = ["San Isidro", "Martínez", "Beccar", "Victoria", "San Fernando"]
 # Búsquedas extra: Google Maps también busca en el texto de las reseñas,
 # y los locales nuevos tienen reseñas que dicen "nuevo", "recién abrió", etc.
-BUSQUEDAS_NUEVOS = ["restaurante nuevo", "recién inaugurado comida"]
+BUSQUEDAS_NUEVOS = []   # ej. ["restaurante nuevo", "recién inaugurado comida"]
 
 MAX_RESENAS = 80        # más reseñas que esto = local viejo, ni lo miramos
 MAX_DIAS = 120          # la reseña más vieja tiene que ser de hace menos de esto
-MAX_CREDITOS = 70       # freno de mano: el script corta si llega a este número de llamadas
-MIN_RESENAS_CONFIANZA = 5   # con menos reseñas, puede ser un local viejo recién cargado en Maps
+MAX_CREDITOS = 50       # freno de mano: el script corta si llega a este número de llamadas
+MIN_RESENAS_CONFIANZA = 5
+SOLO_CONFIRMADOS = True     # descarta los que no tienen ninguna reseña con fecha
+# Locales que ya confirmamos a mano: entran siempre (si pasan los filtros de reseñas)
+CONFIRMADOS_MANUAL = ["Lela cafe", "Morda Café", "Mleko's Smash Burgers", "Hungry's San Isidro"]   # con menos reseñas, puede ser un local viejo recién cargado en Maps
 
 CADENAS = ["café martínez", "mi gusto", "le blé", "havanna", "grido", "mostaza",
            "mcdonald", "burger king", "starbucks", "subway", "blossom", "kentucky",
@@ -57,11 +59,13 @@ CADENAS = ["café martínez", "mi gusto", "le blé", "havanna", "grido", "mostaz
            "betos", "pertutti", "la continental", "moshi moshi", "juan valdez", "tienda de café"]
 # Palabras que se sacan del nombre para detectar sucursales ("Marca San Isidro" = "Marca")
 SUFIJOS_SUCURSAL = ["san isidro", "martinez", "acassuso", "beccar", "boulogne", "villa adelina",
-                    "zona norte", "sucursal", "s.i"]
+                    "victoria", "san fernando", "zona norte", "sucursal", "s.i"]
 
 # Solo nos quedamos con locales cuya dirección esté en estas localidades
 # (Google a veces trae locales de otros partidos, ej. "Parrilla Martinez" en La Matanza)
-LOCALIDADES_VALIDAS = ["san isidro", "martinez", "acassuso", "beccar", "boulogne", "villa adelina"]
+# Código postal -> localidad (Google a veces pone "Buenos Aires" en vez de la localidad)
+CP_LOCALIDAD = {"B1642": "San Isidro", "B1640": "Martínez", "B1643": "Beccar",
+                "B1644": "Victoria", "B1646": "San Fernando"}
 # Nombres que quedan genéricos al sacarles la zona ("Panadería Martínez" -> "panaderia"):
 # no sirven para detectar marcas
 GENERICOS = {"restaurante", "restaurant", "resto", "parrilla", "pizzeria", "hamburgueseria",
@@ -138,7 +142,7 @@ def buscar_locales(consulta, cache, hoy):
     return resultados
 
 
-def fecha_resena_mas_vieja(data_id, hoy):
+def revisar_resenas(data_id, hoy):
     """
     Paso 3: trae las reseñas ordenadas de más nueva a más vieja y recorre
     las páginas. La reseña más vieja es, más o menos, cuándo abrió el local.
@@ -151,22 +155,26 @@ def fecha_resena_mas_vieja(data_id, hoy):
     el local se descarta igual, así que no pedimos más páginas. Un local viejo
     con pocas reseñas recibe pocas por mes, así que casi siempre se descarta
     con la primera página (1 crédito).
+
+    Devuelve (fecha más vieja, si alguna reseña menciona "sucursal").
     """
     params = {"engine": "google_maps_reviews", "data_id": data_id, "sort_by": "newestFirst"}
-    mas_vieja = None
+    mas_vieja, sucursal = None, False
     while True:
         data = llamar_serpapi(params)
         for r in data.get("reviews", []):
+            if "sucursal" in sin_acentos(r.get("snippet") or ""):
+                sucursal = True
             iso = r.get("iso_date")
             if iso:
                 fecha = datetime.fromisoformat(iso.replace("Z", "+00:00"))
                 if mas_vieja is None or fecha < mas_vieja:
                     mas_vieja = fecha
         if mas_vieja is not None and (hoy - mas_vieja).days > MAX_DIAS:
-            return mas_vieja    # ya sabemos que es viejo: no gastamos más créditos
+            return mas_vieja, sucursal    # ya sabemos que es viejo: no gastamos más créditos
         token = data.get("serpapi_pagination", {}).get("next_page_token")
         if not token:
-            return mas_vieja
+            return mas_vieja, sucursal
         # A partir de la 2da página se pueden pedir 20 reseñas por llamada
         params = {**params, "next_page_token": token, "num": 20}
 
@@ -199,9 +207,13 @@ def es_sucursal_de_marca(local, marcas_establecidas):
     return len(base) >= 5 and base not in GENERICOS and base in marcas_establecidas
 
 
-def en_la_zona(local):
-    direccion = sin_acentos(local.get("address") or "")
-    return any(loc in direccion for loc in LOCALIDADES_VALIDAS)
+def localidad(local):
+    """Localidad del local según su código postal (o el texto de la dirección). None = fuera de zona."""
+    direccion = local.get("address") or ""
+    m = re.search(r"B\d{4}", direccion)
+    if m:
+        return CP_LOCALIDAD.get(m.group(0))
+    return next((z for z in ZONAS if sin_acentos(z) in sin_acentos(direccion)), None)
 
 
 def confianza(n_resenas, dias):
@@ -263,6 +275,11 @@ def main():
     except RuntimeError as e:
         print(e)
     guardar_cache(cache)
+    manuales = {sin_acentos(t.replace("´", "'")) for t in CONFIRMADOS_MANUAL}
+    for b in cache["busquedas"].values():
+        for local in b["local_results"]:
+            if sin_acentos(local.get("title", "").replace("´", "'")) in manuales:
+                todos.setdefault(local["data_id"], local)
     print(f"Locales únicos encontrados: {len(todos)} (créditos usados: {creditos_usados})")
 
     # Paso 2: filtros gratis
@@ -272,7 +289,7 @@ def main():
                                  "sucursal de marca": 0}
     for did, local in todos.items():
         n = local.get("reviews", 0) or 0
-        if not en_la_zona(local):
+        if not localidad(local):
             descartes["fuera de zona"] += 1
         elif n > MAX_RESENAS:
             descartes["muchas reseñas"] += 1
@@ -286,42 +303,60 @@ def main():
     print(f"Descartes gratis: {descartes}")
     print(f"Candidatos a revisar: {len(candidatos)}")
 
-    # Paso 3: fecha de la reseña más vieja (esto es lo caro).
-    # Prioridad: los que salieron en búsquedas de "nuevo", después los de menos reseñas.
-    resultados, sin_revisar = [], 0
-    for c in sorted(candidatos, key=lambda x: (not x["_nuevo"], x["_n"])):
-        did = c["data_id"]
-        if did in cache["resenas"]:
-            iso = cache["resenas"][did]
-            fecha = datetime.fromisoformat(iso) if iso else None
-        elif c["_n"] == 0:
-            fecha = None
-        else:
+    # Paso 3: reseñas (esto es lo caro). Primero los que nunca revisamos,
+    # después los que están en caché pero sin el chequeo de "sucursal".
+    def en_cache(did):
+        e = cache["resenas"].get(did, "no")
+        if e == "no":
+            return None
+        return e if isinstance(e, dict) else {"fecha": e, "sucursal": None}   # formato viejo
+
+    def fecha_de(e):
+        return datetime.fromisoformat(e["fecha"]) if e and e["fecha"] else None
+
+    resultados, sin_revisar, con_sucursal = [], [], []
+    orden = sorted(candidatos, key=lambda x: (en_cache(x["data_id"]) is not None, x["_n"]))
+    for c in orden:
+        did, e = c["data_id"], en_cache(c["data_id"])
+        fecha = fecha_de(e)
+        if fecha and (hoy - fecha).days > MAX_DIAS:
+            continue                                  # viejo: ya lo sabíamos, gratis
+        if c["_n"] == 0 and SOLO_CONFIRMADOS:
+            continue                                  # sin reseñas: no se puede confirmar
+        if e is None or e["sucursal"] is None:
             try:
-                fecha = fecha_resena_mas_vieja(did, hoy)
+                fecha, sucursal = revisar_resenas(did, hoy)
             except RuntimeError:
-                sin_revisar += 1
+                sin_revisar.append(c.get("title"))
                 continue
-            cache["resenas"][did] = fecha.isoformat() if fecha else None
+            e = {"fecha": fecha.isoformat() if fecha else None, "sucursal": sucursal}
+            cache["resenas"][did] = e
+            guardar_cache(cache)
         dias = (hoy - fecha).days if fecha else None
         if dias is not None and dias > MAX_DIAS:
             continue
+        if dias is None and SOLO_CONFIRMADOS:
+            continue
+        if e["sucursal"]:
+            con_sucursal.append(c.get("title"))
+            continue
         resultados.append((c, fecha, dias))
     guardar_cache(cache)
+    if con_sucursal:
+        print(f"Descartados por reseñas que mencionan 'sucursal': {con_sucursal}")
     if sin_revisar:
-        print(f"Se acabaron los créditos: quedaron {sin_revisar} candidatos sin revisar "
-              f"(la próxima corrida sigue desde ahí gracias al caché).")
+        print(f"Se acabaron los créditos: quedaron {len(sin_revisar)} sin revisar: {sin_revisar}")
 
     # Paso 4: exportar a Excel, del más nuevo al más viejo.
     # Los que no tienen reseñas van AL FINAL: no tenemos cómo confirmar su fecha.
-    resultados.sort(key=lambda x: (x[2] is None, x[2] or 0))
+    resultados.sort(key=lambda x: (ZONAS.index(localidad(x[0])), x[2] is None, x[2] or 0))
     wb = Workbook()
     ws = wb.active
     ws.title = "Prospectos"
-    ws.append(["Local", "Tipo", "Dirección", "Teléfono", "Web", "Reseñas",
+    ws.append(["Local", "Tipo", "Localidad", "Dirección", "Teléfono", "Web", "Reseñas",
                "Reseña más vieja", "Días", "Confianza", "Para el cliente", "Google Maps"])
     for c, fecha, dias in resultados:
-        ws.append([c.get("title"), c.get("type"), c.get("address"), c.get("phone"),
+        ws.append([c.get("title"), c.get("type"), localidad(c), c.get("address"), c.get("phone"),
                    c.get("website"), c["_n"],
                    fecha.strftime("%d/%m/%Y") if fecha else "sin reseñas",
                    dias, confianza(c["_n"], dias), texto_para_cliente(dias),
