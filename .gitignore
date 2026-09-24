@@ -4,6 +4,7 @@
 # Salidas generadas (datos de prospectos y respuestas crudas de la API)
 *.xlsx
 crudo/
+cache.json
 
 __pycache__/
 *.pyc
